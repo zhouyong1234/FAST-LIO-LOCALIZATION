@@ -7,10 +7,14 @@
 #include <ros/ros.h>
 #include <tf/tf.h>
 #include <tf_conversions/tf_eigen.h>
+#include <tf/transform_datatypes.h>
+#include <tf/transform_broadcaster.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <sensor_msgs/PointCloud2.h>
+#include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/PoseWithCovarianceStamped.h>
 #include <nav_msgs/Odometry.h>
+#include <nav_msgs/Path.h>
 #include <message_filters/subscriber.h>
 #include <message_filters/synchronizer.h>
 #include <message_filters/sync_policies/exact_time.h>
@@ -76,8 +80,13 @@ public:
         _mapSub = _nh.subscribe("/map_cloud", 10, &Localizer::mapCallback, this);
         _initPoseSub = _nh.subscribe("/initialpose", 10, &Localizer::initPoseWithNDTCallback, this);
 
+        // _points_sub = _nh.subscribe("/velodyne_points", 10, &Localizer::pointsCallback, this);
+
+        _ndtPosePub = nh.advertise<nav_msgs::Odometry>("/ndt/odometry", 100000);
+        _ndtPathPub = nh.advertise<nav_msgs::Path>("/ndt/path", 100000);
+
         _pcSubPtr = new message_filters::Subscriber<sensor_msgs::PointCloud2>(nh, "/velodyne_points", 1);
-        _odomSubPtr = new message_filters::Subscriber<nav_msgs::Odometry>(nh, "/odom_lio", 1);
+        _odomSubPtr = new message_filters::Subscriber<nav_msgs::Odometry>(nh, "/Odometry", 1);
         _syncPtr = new message_filters::Synchronizer<syncPolicy>(
                 syncPolicy(10), *_pcSubPtr, *_odomSubPtr
         );
@@ -97,6 +106,9 @@ private:
     ros::NodeHandle &_nh;
     ros::Subscriber _mapSub;
     ros::Subscriber _initPoseSub;
+    ros::Subscriber _points_sub;
+    ros::Publisher _ndtPosePub;
+    ros::Publisher _ndtPathPub;
     tf2_ros::TransformBroadcaster _br;
     message_filters::Subscriber<sensor_msgs::PointCloud2> *_pcSubPtr;
     message_filters::Subscriber<nav_msgs::Odometry> *_odomSubPtr;
@@ -104,11 +116,14 @@ private:
     typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::PointCloud2, nav_msgs::Odometry> syncPolicy;
     message_filters::Synchronizer<syncPolicy> *_syncPtr;
 
+    nav_msgs::Path _ndtPath;
+
     NDT _ndt;
     pcl::VoxelGrid<pcl::PointXYZI> _voxelGridFilter;
     Config _cfg;
     Cloud::Ptr _mapPtr, _mapFilteredPtr;
     tf::Pose _baseOdom, _odomMap;
+    tf::Transform _baseMap;
     sensor_msgs::PointCloud2::ConstPtr _pcPtr = nullptr;
 
     void mapCallback(const sensor_msgs::PointCloud2::ConstPtr &msg)
@@ -143,8 +158,39 @@ private:
         publishTF();
     }
 
+    void pointsCallback(const sensor_msgs::PointCloud2::ConstPtr &points_msg)
+    {
+        Cloud::Ptr tmpCloudPtr(new Cloud);
+        pcl::fromROSMsg(*points_msg, *tmpCloudPtr);
+        Cloud::Ptr filteredCloudPtr(new Cloud);
+        _voxelGridFilter.setInputCloud(tmpCloudPtr);
+        _voxelGridFilter.filter(*filteredCloudPtr);
+        Cloud::Ptr scanCloudPtr(new Cloud);
+        for(const auto &p: *filteredCloudPtr)
+        {
+            auto r = hypot(p.x, p.y);
+            if(r > _cfg.ndt.minScanRange and r < _cfg.ndt.maxScanRange)
+            {
+                scanCloudPtr->push_back(p);
+            }
+        }
+
+        _ndt.setInputSource(scanCloudPtr);
+
+        Eigen::Matrix4f init_guess = Eigen::Matrix4f::Identity();
+        Cloud::Ptr aligned(new Cloud);
+        _ndt.align(*aligned, init_guess);
+
+        Eigen::Matrix4f trans = _ndt.getFinalTransformation();
+        Eigen::Vector3f p = trans.block<3, 1>(0,3);
+        Eigen::Quaternionf q(trans.block<3, 3>(0,0));
+
+        publishPoseTF(p, q);
+    }
+
     void syncCallback(const sensor_msgs::PointCloud2::ConstPtr &pcMsg, const nav_msgs::Odometry::ConstPtr &odomMsg)
     {
+        // std::cout << "syncCallback" << std::endl;
         _pcPtr = pcMsg;
         static chrono::steady_clock::time_point t0, t1;
         tf::poseMsgToTF(odomMsg->pose.pose, _baseOdom);
@@ -155,10 +201,14 @@ private:
         if (hypot(T.getOrigin().x(), T.getOrigin().y()) > _cfg.ndt.threshShift or
             tf::getYaw(T.getRotation()) > _cfg.ndt.threshRot)
         {
+            std::cout << _odomMap.getOrigin().x() << ", " << _odomMap.getOrigin().y() << std::endl;
+            std::cout << _odomMap.getOrigin().getX() <<  ", " << _odomMap.getOrigin().getY() << std::endl;
             match(pcMsg, _odomMap * _baseOdom);
             lastNDTPose = _baseOdom;
         }
-        publishTF();
+        // publishTF();
+        // std::cout << "publish pose" << std::endl;
+        // publishPose();
     }
 
     /**
@@ -196,6 +246,22 @@ private:
         tf::Transform baseMapNDT;
         tf::poseEigenToTF(Eigen::Affine3d(tNDT.cast<double>()), baseMapNDT);
         _odomMap = baseMapNDT * _baseOdom.inverse();
+        _baseMap = baseMapNDT;
+
+        Eigen::Vector3f pose_map;
+        Eigen::Quaternionf rotation_map;
+        pose_map[0] = _baseMap.getOrigin().getX();
+        pose_map[1] = _baseMap.getOrigin().getY();
+        pose_map[2] = _baseMap.getOrigin().getZ();
+
+        rotation_map.x() = _baseMap.getRotation().getX();
+        rotation_map.y() = _baseMap.getRotation().getY();
+        rotation_map.z() = _baseMap.getRotation().getZ();
+        rotation_map.w() = _baseMap.getRotation().getW();
+
+        publishPoseTF(pose_map, rotation_map);
+
+        // std::cout << _baseMap.getOrigin().getX() << ", " << _baseMap.getOrigin().getY() << std::endl;
 
         if (_cfg.ndt.debug) ROS_INFO("NDT: %ldms", chrono::duration_cast<chrono::milliseconds>(t1 - t0).count());
         ROS_INFO("NDT Relocated");
@@ -216,6 +282,50 @@ private:
         tfMsg.transform.rotation.w = _odomMap.getRotation().w();
 
         _br.sendTransform(tfMsg);
+    }
+
+    void publishPoseTF(Eigen::Vector3f &p, Eigen::Quaternionf &q)
+    {
+        nav_msgs::Odometry pose;
+        pose.header.stamp = ros::Time::now();
+        pose.header.frame_id = "map";
+        pose.child_frame_id = "velodyne";
+        pose.pose.pose.position.x = p[0];
+        pose.pose.pose.position.y = p[1];
+        pose.pose.pose.position.z = p[2];
+        pose.pose.pose.orientation.x = q.x();
+        pose.pose.pose.orientation.y = q.y();
+        pose.pose.pose.orientation.z = q.z();
+        pose.pose.pose.orientation.w = q.w();
+        _ndtPosePub.publish(pose);
+
+        geometry_msgs::PoseStamped this_pose_stamped;
+        this_pose_stamped.header.stamp = pose.header.stamp;
+        this_pose_stamped.header.frame_id = "map";
+        this_pose_stamped.pose.position.x = p[0];
+        this_pose_stamped.pose.position.y = p[1];
+        this_pose_stamped.pose.position.z = p[2];
+        this_pose_stamped.pose.orientation.x = q.x();
+        this_pose_stamped.pose.orientation.y = q.y();
+        this_pose_stamped.pose.orientation.z = q.z();
+        this_pose_stamped.pose.orientation.w = q.w();
+
+        _ndtPath.header.stamp = pose.header.stamp;
+        _ndtPath.header.frame_id = "map";
+        _ndtPath.poses.push_back(this_pose_stamped);
+        _ndtPathPub.publish(_ndtPath);
+
+
+        static tf::TransformBroadcaster br;
+        tf::Transform transform;
+        tf::Quaternion rotation;
+        transform.setOrigin(tf::Vector3(p[0], p[1], p[2]));
+        rotation.setW(q.w());
+        rotation.setX(q.x());
+        rotation.setY(q.y());
+        rotation.setZ(q.z());
+        transform.setRotation(rotation);
+        br.sendTransform(tf::StampedTransform(transform, pose.header.stamp, "map", "velodyne"));
     }
 };
 
